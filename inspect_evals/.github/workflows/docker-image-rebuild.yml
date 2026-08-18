@@ -1,0 +1,304 @@
+name: Docker Images for Evals
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: true
+
+# GHCR push uses GL_GHCR_TOKEN (not GITHUB_TOKEN), so the workflow's
+# GITHUB_TOKEN never needs packages: write.
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare:
+    if: github.event.repository.fork == false
+    name: Prepare Docker Build Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      evals: ${{ steps.prepare.outputs.evals }}
+      push: ${{ steps.prepare.outputs.push }}
+      build_date: ${{ steps.prepare.outputs.build_date }}
+      commit_tag: ${{ steps.prepare.outputs.commit_tag }}
+    env:
+      TO_REBUILD_IMAGES: "bigcodebench;class_eval;ds1000;kernelbench" #TODO: Add ;frontier_cs;ifevalcode;scbench
+      ONLY_REBUILD_CHANGED_EVALS: ${{ github.event_name != 'workflow_dispatch' }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Get changed files
+        if: env.ONLY_REBUILD_CHANGED_EVALS == 'true'
+        id: changed
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          files_yaml: |
+            eval_src:
+              - src/inspect_evals/**/*
+
+      - name: Prepare eval list and metadata
+        id: prepare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVAL_SRC: ${{ steps.changed.outputs.eval_src_all_changed_files }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          event_name = os.environ.get('EVENT_NAME', '')
+          changed_files = os.environ.get('EVAL_SRC', '').split()
+          to_rebuild = os.environ.get('TO_REBUILD_IMAGES', '').split(';')
+
+          if event_name == 'workflow_dispatch':
+              found = to_rebuild
+          else:
+              found_set = set()
+              for f in changed_files:
+                  p = Path(f)
+                  if p.name.lower() == 'readme.md':
+                      continue
+
+                  parts = p.parts
+                  if len(parts) >= 3 and parts[0] == 'src' and parts[1] == 'inspect_evals':
+                      eval_name = parts[2]
+                      if eval_name in to_rebuild:
+                          found_set.add(eval_name)
+
+              found = sorted(found_set)
+
+          evals = ' '.join(found)
+          push = 'true' if event_name in {'push', 'workflow_dispatch'} else 'false'
+          build_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+          commit_tag = os.environ.get('GIT_SHA', '')[:12]
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'evals={evals}\n')
+              out.write(f'push={push}\n')
+              out.write(f'build_date={build_date}\n')
+              out.write(f'commit_tag={commit_tag}\n')
+
+          print(f'EVALS={evals}')
+          print(f'PUSH={push}')
+          print(f'BUILD_DATE={build_date}')
+          print(f'COMMIT_TAG={commit_tag}')
+          PY
+
+  docker-build:
+    if: github.event.repository.fork == false && needs.prepare.outputs.evals != ''
+    name: Build Docker Images (${{ matrix.arch }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-latest
+            tag_suffix: amd64
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            tag_suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      REGISTRY: ghcr.io
+      NAMESPACE: Generality-Labs
+      EVALS: ${{ needs.prepare.outputs.evals }}
+      PUSH_IMAGES: ${{ needs.prepare.outputs.push }}
+      BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
+      COMMIT_TAG: ${{ needs.prepare.outputs.commit_tag }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Login to GitHub Container Registry (push only)
+        if: env.PUSH_IMAGES == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GL_GHCR_USERNAME }}
+          password: ${{ secrets.GL_GHCR_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Free disk space for large images
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - name: Build images for architecture
+        # `matrix.*` values are static workflow definitions, not external
+        # input, so there's no real injection vector here. Pass them as env
+        # vars anyway so zizmor's template-injection rule stays clean and
+        # the same pattern is used everywhere in this repo.
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          MATRIX_TAG_SUFFIX: ${{ matrix.tag_suffix }}
+        run: |
+          set +e
+          overall_status=0
+          namespace_lower=$(echo "$NAMESPACE" | tr '[:upper:]' '[:lower:]')
+
+          for eval_name in $EVALS; do
+              dockerfile="src/inspect_evals/$eval_name/Dockerfile"
+
+              platforms=$(python tools/docker_build_config.py --dockerfile "$dockerfile" --field platforms)
+              case ",$platforms," in
+                  *",$MATRIX_PLATFORM,"*) ;;
+                  *)
+                      echo "Skipping $eval_name for $MATRIX_PLATFORM (declares: $platforms)"
+                      continue
+                      ;;
+              esac
+
+              echo "Building $eval_name for $MATRIX_PLATFORM"
+              context_dir=$(python tools/docker_build_config.py --dockerfile "$dockerfile" --field context)
+              image_name=$(python tools/docker_build_config.py --dockerfile "$dockerfile" --field image_name)
+
+              image_ref="$REGISTRY/$namespace_lower/$image_name"
+              build_arch_tag="$image_ref:build-${COMMIT_TAG}-${MATRIX_TAG_SUFFIX}"
+              date_build_arch_tag="$image_ref:${BUILD_DATE}-${COMMIT_TAG}-${MATRIX_TAG_SUFFIX}"
+              cache_scope="${eval_name}-${MATRIX_TAG_SUFFIX}"
+
+              if [ "$PUSH_IMAGES" = "true" ]; then
+                  docker buildx build \
+                      --platform "$MATRIX_PLATFORM" \
+                      -f "$dockerfile" \
+                      --cache-from "type=gha,scope=$cache_scope" \
+                      --cache-to "type=gha,mode=max,scope=$cache_scope" \
+                      -t "$build_arch_tag" \
+                      -t "$date_build_arch_tag" \
+                      --push \
+                      "$context_dir"
+                  build_rc=$?
+              else
+                  docker buildx build \
+                      --platform "$MATRIX_PLATFORM" \
+                      -f "$dockerfile" \
+                      --cache-from "type=gha,scope=$cache_scope" \
+                      --cache-to "type=gha,mode=max,scope=$cache_scope" \
+                      "$context_dir"
+                  build_rc=$?
+              fi
+
+              if [ $build_rc -ne 0 ]; then
+                  echo "Image build failed for $eval_name on $MATRIX_ARCH"
+                  overall_status=1
+              else
+                  echo "Succeeded for $eval_name on $MATRIX_ARCH"
+              fi
+          done
+
+          exit $overall_status
+
+  publish-manifests:
+    if: always() && !cancelled() && github.event.repository.fork == false && needs.prepare.outputs.push == 'true' && needs.prepare.outputs.evals != ''
+    name: Publish Multi-Arch Manifests
+    needs:
+      - prepare
+      - docker-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      REGISTRY: ghcr.io
+      NAMESPACE: Generality-Labs
+      EVALS: ${{ needs.prepare.outputs.evals }}
+      BUILD_DATE: ${{ needs.prepare.outputs.build_date }}
+      COMMIT_TAG: ${{ needs.prepare.outputs.commit_tag }}
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ secrets.GL_GHCR_USERNAME }}
+          password: ${{ secrets.GL_GHCR_TOKEN }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Publish manifest list tags
+        run: |
+          set +e
+          overall_status=0
+          namespace_lower=$(echo "$NAMESPACE" | tr '[:upper:]' '[:lower:]')
+
+          for eval_name in $EVALS; do
+              dockerfile="src/inspect_evals/$eval_name/Dockerfile"
+              image_name=$(python tools/docker_build_config.py --dockerfile "$dockerfile" --field image_name)
+              platforms=$(python tools/docker_build_config.py --dockerfile "$dockerfile" --field platforms)
+
+              image_ref="$REGISTRY/$namespace_lower/$image_name"
+
+              # Verify every declared arch tag was pushed before creating manifests
+              build_tags=()
+              date_build_tags=()
+              missing=""
+              for platform in $(echo "$platforms" | tr ',' ' '); do
+                  arch="${platform#linux/}"
+                  build_tag="$image_ref:build-${COMMIT_TAG}-${arch}"
+                  docker buildx imagetools inspect "$build_tag" > /dev/null 2>&1 || missing="$missing $arch"
+                  build_tags+=("$build_tag")
+                  date_build_tags+=("$image_ref:${BUILD_DATE}-${COMMIT_TAG}-${arch}")
+              done
+              if [ -n "$missing" ]; then
+                  echo "Skipping $eval_name: missing arch tag(s):$missing"
+                  overall_status=1
+                  continue
+              fi
+
+              docker buildx imagetools create -t "$image_ref:latest" "${build_tags[@]}"
+              latest_rc=$?
+
+              docker buildx imagetools create -t "$image_ref:$BUILD_DATE" "${date_build_tags[@]}"
+              date_rc=$?
+
+              if [ $latest_rc -ne 0 ] || [ $date_rc -ne 0 ]; then
+                  echo "Manifest publish failed for $image_ref"
+                  overall_status=1
+              else
+                  echo "Published manifest tags for $image_ref"
+              fi
+          done
+
+          exit $overall_status

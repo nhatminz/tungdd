@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+# ruff: noqa: E402
+"""Subprocess runner for isolated kernel evaluation.
+
+This script runs kernel evaluation in an isolated subprocess to prevent
+buggy CUDA kernels from crashing the parent process.
+"""
+
+import json
+import logging
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Literal, NotRequired, TypedDict
+
+logger = logging.getLogger(__name__)
+
+
+# Remove paths that would shadow the installed 'kernelbench' package:
+# 1. The project's src/ directory (contains inspect_evals/kernelbench/)
+# 2. The script's directory (contains kernelbench.py which shadows the package)
+def filter_sys_path(sys_path: list[str]) -> list[str]:
+    script_dir = __file__.rsplit("/", 1)[0] if "/" in __file__ else "."
+    return [p for p in sys_path if not p.endswith("/src") and p != script_dir]
+
+
+sys.path = filter_sys_path(sys.path)
+
+try:
+    import kernelbench.eval as kernelbench_eval
+except ImportError:
+    kernelbench_eval = None  # type: ignore[assignment]
+
+
+class MaxRetriesError(RuntimeError):
+    """Raised when the maximum number of retries is reached."""
+
+    pass
+
+
+class KernelEvalSuccess(TypedDict):
+    """Serialized ``KernelExecResult``: the kernel was evaluated to a verdict.
+
+    Negative verdicts are encoded here, not as errors: ``compiled=False``
+    means the model's kernel failed to compile, and ``correctness=False``
+    covers runtime errors and incorrect outputs. ``metadata`` carries
+    KernelBench's diagnostic detail (e.g. ``compilation_error``,
+    ``runtime_error``, ``correctness_issue``).
+    """
+
+    compiled: bool
+    correctness: bool
+    runtime: float
+    ref_runtime: float
+    metadata: dict[str, Any]
+
+
+class KernelEvalError(TypedDict):
+    """No verdict was reached on the kernel; ``error`` describes why.
+
+    ``error_kind`` records which path produced the error, so the scorer can
+    attribute it without parsing the message:
+
+    - ``"retry_exhausted"``: every attempt hit compilation lock contention
+      (transient infrastructure contention; rerunning may succeed).
+    - ``"exception"``: an exception escaped ``eval_kernel_against_ref``;
+      ``traceback`` carries the full traceback for diagnosis.
+    """
+
+    error: str
+    error_kind: Literal["retry_exhausted", "exception"]
+    traceback: NotRequired[str]
+
+
+def try_eval_kernel_against_ref_with_backoff(
+    original_model_src: str,
+    custom_model_src: str,
+    num_correct_trials: int,
+    num_perf_trials: int,
+    measure_performance: bool,
+    timing_method: str,
+    verbose: bool,
+    max_retries: int,
+    retry_delay: int,
+    max_retries_delay: int,
+    precision: Any,
+    build_dir: str,
+    device: int,
+    backend: str,
+) -> KernelEvalSuccess | KernelEvalError:
+    """Run ``eval_kernel_against_ref``, retrying on compilation lock contention.
+
+    ``eval_kernel_against_ref`` encodes verdicts on the model's kernel in its
+    return value rather than raising (see ``KernelEvalSuccess``), and returns
+    ``None`` for exactly one condition: a lock-file error during concurrent
+    compilation, which is transient and safe to retry. This wrapper retries
+    ``None`` results with exponential backoff.
+
+    Returns:
+        ``KernelEvalSuccess`` when the kernel was evaluated to a verdict,
+        including negative ones (``compiled=False``, ``correctness=False``).
+
+        ``KernelEvalError`` when no verdict was reached: an exception escaped
+        ``eval_kernel_against_ref`` (e.g. the reference model failed to load,
+        CUDA/device setup failed, or the kernel's instantiation raised
+        something other than ``RuntimeError``), or every retry hit lock
+        contention. These are not verdicts on the kernel; ``error_kind``
+        records which of the two paths produced the error. The scorer
+        branches on the presence of the ``"error"`` key to tell the payloads
+        apart.
+    """
+    delay = retry_delay
+    start_time = time.time()
+
+    for retry_count in range(max_retries):
+        try:
+            eval_result = kernelbench_eval.eval_kernel_against_ref(
+                original_model_src=original_model_src,
+                custom_model_src=custom_model_src,
+                num_correct_trials=num_correct_trials,
+                num_perf_trials=num_perf_trials,
+                measure_performance=measure_performance,
+                timing_method=timing_method,
+                verbose=verbose,
+                build_dir=Path(build_dir),
+                device=device,
+                backend=backend,
+                precision=precision,
+            )
+
+            if eval_result is not None:
+                return {
+                    "compiled": eval_result.compiled,
+                    "correctness": eval_result.correctness,
+                    "runtime": eval_result.runtime,
+                    "ref_runtime": eval_result.ref_runtime,
+                    "metadata": eval_result.metadata,
+                }
+            else:
+                logger.warning(
+                    f"KernelBench returned None; retrying {retry_count + 1} of {max_retries}. This indicates a lock issue during compilation. The scoring should be run again "
+                )
+        except Exception as e:
+            return {
+                "error": str(e),
+                "error_kind": "exception",
+                "traceback": traceback.format_exc(),
+            }
+
+        time.sleep(delay)
+        delay = min(delay * 2, max_retries_delay)
+
+    elapsed_time = time.time() - start_time
+    return {
+        "error": f"Kernel evaluation failed after {retry_count + 1} retries over {elapsed_time:.2f} seconds. This indicates a lock issue during compilation. The scoring should be run again on this sample.",
+        "error_kind": "retry_exhausted",
+    }
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run kernel evaluation in isolation")
+    parser.add_argument(
+        "--ref-arch-file",
+        required=True,
+        help="Path to reference architecture source file",
+    )
+    parser.add_argument(
+        "--kernel-file", required=True, help="Path to kernel source file"
+    )
+    parser.add_argument(
+        "--output-file", required=True, help="Path to write JSON result"
+    )
+    parser.add_argument("--num-correct-trials", type=int, default=5)
+    parser.add_argument("--num-perf-trials", type=int, default=100)
+    parser.add_argument("--measure-performance", action="store_true")
+    parser.add_argument("--timing-method", default="cuda_event")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--build-dir", required=True)
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--backend", default="cuda")
+    parser.add_argument("--precision", default="fp32")
+    parser.add_argument("--max-retries", type=int, default=10)
+    parser.add_argument("--retry-delay", type=int, default=1)
+    parser.add_argument("--max-retries-delay", type=int, default=60)
+    args = parser.parse_args()
+
+    with open(args.ref_arch_file) as f:
+        ref_arch_src = f.read()
+    with open(args.kernel_file) as f:
+        kernel_src = f.read()
+
+    precision_dtype = kernelbench_eval.get_torch_dtype_from_string(args.precision)
+
+    try:
+        result = try_eval_kernel_against_ref_with_backoff(
+            original_model_src=ref_arch_src,
+            custom_model_src=kernel_src,
+            num_correct_trials=args.num_correct_trials,
+            num_perf_trials=args.num_perf_trials,
+            measure_performance=args.measure_performance,
+            timing_method=args.timing_method,
+            verbose=args.verbose,
+            max_retries=args.max_retries,
+            max_retries_delay=args.max_retries_delay,
+            retry_delay=args.retry_delay,
+            precision=precision_dtype,
+            build_dir=args.build_dir,
+            device=args.device,
+            backend=args.backend,
+        )
+    except Exception as e:
+        result = {
+            "error": str(e),
+            "error_kind": "exception",
+            "traceback": traceback.format_exc(),
+        }
+
+    with open(args.output_file, "w") as f:
+        try:
+            json.dump(result, f, default=str)
+        except Exception as e:
+            print(f"Error writing result to {args.output_file}: {e}, result: {result}")
+            raise e
+    return 0
+
+
+if __name__ == "__main__":
+    main()

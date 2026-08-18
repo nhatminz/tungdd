@@ -1,0 +1,70 @@
+# Adapted from https://github.com/TheAgentCompany/TheAgentCompany (MIT License)
+
+"""Host-side scorer factory for test_basic_llm_judge.
+
+Not adapted from TheAgentCompany, a custom task to test eval set up.
+"""
+
+from inspect_ai.model import Model, get_model
+from inspect_ai.scorer import (
+    Score,
+    Scorer,
+    Target,
+    scorer,
+)
+from inspect_ai.solver import TaskState
+
+from inspect_evals.theagentcompany.common_evaluators import (
+    run_llm_judge_items,
+    sandbox_file_exists,
+)
+from inspect_evals.theagentcompany.scoring import (
+    TAC_SCORER_METRICS,
+    Checkpoint,
+    make_tac_score,
+)
+
+
+@scorer(metrics=TAC_SCORER_METRICS)
+def build_scorer(judge_model: str | Model | None = None) -> Scorer:
+    """Return the scorer for test_basic_llm_judge."""
+
+    async def score(state: TaskState, target: Target) -> Score:
+        poem_path = "/workspace/poem.txt"
+
+        # Checkpoint 1: poem.txt exists in the sandbox.
+        cp1_pass = await sandbox_file_exists(poem_path)
+
+        checkpoints: list[Checkpoint] = [
+            Checkpoint(total=1, result=1 if cp1_pass else 0),
+        ]
+
+        # Checkpoint 2: LLM-judged poem quality (judge runs on host; poem read from sandbox).
+        llm_judge_items: list[dict[str, object]] = [
+            {
+                "id": 2,
+                "file": poem_path,
+                "criteria": (
+                    "Is this a well-written poem (roughly 10 lines, ideally rhyming) "
+                    "about a relational database management system called BusTub?"
+                ),
+            },
+        ]
+
+        model = (
+            get_model(judge_model)
+            if isinstance(judge_model, str)
+            else (judge_model or get_model(role="grader"))
+        )
+
+        await run_llm_judge_items(model, llm_judge_items, checkpoints)
+
+        all_pass = bool(checkpoints) and all(cp.result == 1 for cp in checkpoints)
+        return make_tac_score(
+            passed=all_pass,
+            checkpoints=checkpoints,
+            checker="host:test_basic_llm_judge",
+            explanation=f"Checkpoints: {checkpoints}",
+        )
+
+    return score

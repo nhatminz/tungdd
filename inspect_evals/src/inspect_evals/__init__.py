@@ -1,0 +1,3 @@
+from inspect_evals.offline import install_offline_network_guard
+
+install_offline_network_guard()

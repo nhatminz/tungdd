@@ -1,0 +1,25 @@
+# Paper-faithful run config for SimpleQA (Wei et al., 2024)
+#
+# Single-file --run-config format (inspect_ai >= 0.3.221). Combines
+# generate_config + model_roles in one document so the eval can be
+# launched with a single flag.
+#
+# Provenance:
+#   temperature: openai/simple-evals ChatCompletionSampler default (0.5)
+#   max_tokens: openai/simple-evals simple_evals.py per-model override (sampler default is 1024)
+#   grader model: paper used gpt-4o; current simple_evals.py uses gpt-4.1
+#   grader temperature: openai/simple-evals ChatCompletionSampler default (0.5)
+#
+# Usage:
+#   inspect eval inspect_evals/simpleqa \
+#       --run-config src/inspect_evals/simpleqa/paper_config/simpleqa.yaml
+
+generate_config:
+  temperature: 0.5
+  max_tokens: 2048
+
+model_roles:
+  grader:
+    model: openai/gpt-4o
+    config:
+      temperature: 0.5

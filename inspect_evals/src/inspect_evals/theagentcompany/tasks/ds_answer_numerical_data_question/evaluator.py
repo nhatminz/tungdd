@@ -1,0 +1,169 @@
+# Adapted from https://github.com/TheAgentCompany/TheAgentCompany (MIT License)
+
+"""Host-side scorer for ds_answer_numerical_data_question.
+
+Adapted from https://github.com/TheAgentCompany/TheAgentCompany/blob/main/workspaces/tasks/ds-answer-numerical-data-question/evaluator.py
+
+Matches the original TheAgentCompany grading:
+
+- Read ``answer.docx`` like ``python-docx``: main-document paragraphs only, in
+  order, joined with newlines (including empty paragraphs).
+- ``content.strip().split`` on newline, then locate the first answer line with an
+  LLM (like the reference grader), take three consecutive lines, and grade each
+  with an LLM using the original predicate strings.
+- Three checkpoints, **2 points** each (``value`` is 0 or 2), 6 points total.
+
+Parsing uses the stdlib (OOXML zip + XML) on the host after reading the file
+from the sandbox — no Python copied into the container.
+"""
+
+import logging
+from typing import Any
+
+from inspect_ai.model import Model, get_model
+from inspect_ai.scorer import (
+    Score,
+    Scorer,
+    Target,
+    scorer,
+)
+from inspect_ai.solver import TaskState
+
+from inspect_evals.theagentcompany.common_evaluators import (
+    lines_for_grading,
+    read_bytes_from_sandbox,
+)
+from inspect_evals.theagentcompany.scoring import (
+    TAC_SCORER_METRICS,
+    Checkpoint,
+    ScoringMode,
+    make_tac_score,
+)
+
+logger = logging.getLogger(__name__)
+
+ANSWER_FILE = "/workspace/answer.docx"
+
+# Original predicates from the reference grader (evaluate_with_llm) - this expects answers to three decimal places
+ORIGINAL_LLM_CRITERIA: list[str] = [
+    "the content contains the correct answer `Tea (including ice tea)`",
+    "the content contains the correct answer `88.475`",
+    "the content has the correct answer `74.775`",
+]
+
+# Improved predicates from the reference grader (evaluate_with_llm) - this expects answers to be rounded to two decimal places, and tolerates percent signs.
+IMPROVED_LLM_CRITERIA: list[str] = [
+    "The beginning of the content includes `Tea (including ice tea)`, or something similar",
+    (
+        "The first numerical value in the content has the value `88.475` (or `88.475%`) or a rounded "
+        "equivalent such as `88.5` / `88.5%`"
+    ),
+    (
+        "The second numerical value in the content has the value `74.775` (or `74.775%`) or a rounded "
+        "equivalent such as `74.8` / `74.8%`"
+    ),
+]
+
+# Original: Checkpoint(2, int(passed) * 2)
+POINTS_PER_CHECKPOINT = 2
+
+
+@scorer(metrics=TAC_SCORER_METRICS)
+def build_scorer(
+    judge_model: str | Model | None = None,
+    *,
+    scoring_mode: ScoringMode = "original",
+) -> Scorer:
+    """Return the scorer for ds_answer_numerical_data_question.
+
+    In the `original` scoring mode, the text is split into newlines and each line is graded with the original LLM criteria,
+    requiring answers to be exact matches to three decimal places. This risks failing the evaluation either if the newline splits are slightly off, or if the model rounds the answers to two decimal places. It also does expect percent signs.
+
+    In the `improved` scoring mode, the text is taken as a whole and graded with the improved LLM criteria which accept rounded values. This is flexible to newline splits and rounding. It also tolerates percent signs.
+    """
+
+    async def score(state: TaskState, target: Target) -> Score:  # type: ignore[no-untyped-def]
+        data = await read_bytes_from_sandbox(ANSWER_FILE)
+        raw: bytes = data if data is not None else b""
+        if not raw:
+            logger.warning(
+                "ds_answer_numerical_data_question: no bytes from %s",
+                ANSWER_FILE,
+            )
+
+        lines = lines_for_grading(raw)
+
+        checkpoints: list[Checkpoint] = []
+        model = (
+            get_model(judge_model)
+            if isinstance(judge_model, str)
+            else (judge_model or get_model(role="grader"))
+        )
+        from inspect_evals.theagentcompany.common_evaluators import run_llm_judge_items
+
+        def get_original_judge_items(
+            lines: list[str], criteria: list[str]
+        ) -> list[dict[str, Any]]:
+            """Put together the judge items for the original scoring mode, each line is graded with the original criteria."""
+            judge_items: list[dict[str, Any]] = []
+            for i, criterion in enumerate(criteria):
+                line = lines[i] if i < len(lines) else ""
+                judge_items.append(
+                    {
+                        "id": i + 1,
+                        "content": line,
+                        "criteria": criterion,
+                        "pass_value": POINTS_PER_CHECKPOINT,
+                    }
+                )
+            return judge_items
+
+        def get_improved_judge_items(
+            lines: list[str], criteria: list[str]
+        ) -> list[dict[str, Any]]:
+            """Put together the judge items for the improved scoring mode, the whole document is graded with the improved criteria."""
+            judge_items: list[dict[str, Any]] = []
+            joined_response = "\n".join(lines)
+            for i, criterion in enumerate(criteria):
+                judge_items.append(
+                    {
+                        "id": i + 1,
+                        "content": joined_response,
+                        "criteria": criterion,
+                        "pass_value": POINTS_PER_CHECKPOINT,
+                    }
+                )
+            return judge_items
+
+        if scoring_mode == "original":
+            judge_items = get_original_judge_items(lines, ORIGINAL_LLM_CRITERIA)
+        elif scoring_mode == "improved":
+            judge_items = get_improved_judge_items(lines, IMPROVED_LLM_CRITERIA)
+        else:
+            logger.warning(
+                "ds_answer_numerical_data_question: invalid scoring_mode=%r; using original",
+                scoring_mode,
+            )
+            judge_items = get_original_judge_items(lines, ORIGINAL_LLM_CRITERIA)
+
+        try:
+            await run_llm_judge_items(model, judge_items, checkpoints)
+        except Exception as e:
+            logger.warning("ds_answer_numerical_data_question: LLM judge failed: %s", e)
+            checkpoints.clear()
+            checkpoints.extend(
+                Checkpoint(total=POINTS_PER_CHECKPOINT, result=0) for _ in (1, 2, 3)
+            )
+
+        all_pass = bool(checkpoints) and all(
+            cp.result == POINTS_PER_CHECKPOINT for cp in checkpoints
+        )
+        return make_tac_score(
+            passed=all_pass,
+            checkpoints=checkpoints,
+            checker="host:ds_answer_numerical_data_question",
+            explanation=f"Checkpoints: {checkpoints}",
+            metadata_extra={"scoring_mode": scoring_mode},
+        )
+
+    return score
